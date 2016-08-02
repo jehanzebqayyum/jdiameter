@@ -19,16 +19,6 @@
 
 package org.jdiameter.client.impl.transport.tls.netty;
 
-import java.io.IOException;
-import java.net.InetSocketAddress;
-
-import org.jdiameter.api.Configuration;
-import org.jdiameter.client.api.IMessage;
-import org.jdiameter.client.api.parser.IMessageParser;
-import org.jdiameter.common.api.concurrent.IConcurrentFactory;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import io.netty.bootstrap.Bootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelInitializer;
@@ -37,6 +27,22 @@ import io.netty.channel.EventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslHandler;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+
+import javax.net.ssl.SSLEngine;
+
+import org.jdiameter.api.Configuration;
+import org.jdiameter.client.api.IMessage;
+import org.jdiameter.client.api.parser.IMessageParser;
+import org.jdiameter.common.api.concurrent.IConcurrentFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 
@@ -45,10 +51,10 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 public class TLSTransportClient {
   private static final Logger logger = LoggerFactory.getLogger(TLSTransportClient.class);
 
-  private TLSClientConnection parentConnection;
-  private IConcurrentFactory concurrentFactory;
-  private IMessageParser parser;
-  private Configuration config;
+  private final TLSClientConnection parentConnection;
+  private final IConcurrentFactory concurrentFactory;
+  private final IMessageParser parser;
+  private final Configuration config;
 
   private InetSocketAddress destAddress;
   private InetSocketAddress origAddress;
@@ -57,27 +63,35 @@ public class TLSTransportClient {
   private Channel channel;
   private EventLoopGroup workerGroup;
 
+  private final boolean isServer;
+  private volatile boolean hasClientInbandSecurity = false;
   private volatile TlsHandshakingState tlsHandshakingState = TlsHandshakingState.INIT;
 
   enum TlsHandshakingState {
     INIT, SHAKING, SHAKEN
   }
 
-  protected TLSTransportClient(TLSClientConnection parenConnection, IConcurrentFactory concurrentFactory, IMessageParser parser,
-      Configuration config) {
+  protected TLSTransportClient(TLSClientConnection parenConnection, IConcurrentFactory concurrentFactory,
+      IMessageParser parser, Configuration config) {
     this.parentConnection = parenConnection;
     this.concurrentFactory = concurrentFactory;
     this.parser = parser;
     this.config = config;
+    this.isServer = false;
   }
 
   public TLSTransportClient(TLSClientConnection parenConnection, IConcurrentFactory concurrentFactory, IMessageParser parser,
       Configuration config, InetSocketAddress destAddress, InetSocketAddress origAddress) {
-    this(parenConnection, concurrentFactory, parser, config);
+    this.parentConnection = parenConnection;
+    this.concurrentFactory = concurrentFactory;
+    this.parser = parser;
+    this.config = config;
+    this.isServer = false;
 
     if (destAddress == null) {
       throw new IllegalArgumentException("Destination address is required");
     }
+
     this.destAddress = destAddress;
     this.origAddress = origAddress;
     this.socketDescription = origAddress.toString() + "->" + destAddress.toString();
@@ -87,19 +101,24 @@ public class TLSTransportClient {
 
   public TLSTransportClient(TLSClientConnection parenConnection, IConcurrentFactory concurrentFactory, IMessageParser parser,
       Configuration config, Channel channel) {
-    this(parenConnection, concurrentFactory, parser, config);
+    this.parentConnection = parenConnection;
+    this.concurrentFactory = concurrentFactory;
+    this.parser = parser;
+    this.config = config;
+    this.isServer = true;
+
     if (channel == null) {
       throw new IllegalArgumentException("Channel is required");
     }
+
     this.channel = channel;
     this.origAddress = (InetSocketAddress) this.channel.localAddress();
     this.destAddress = (InetSocketAddress) this.channel.remoteAddress();
     this.socketDescription = origAddress.toString() + "->" + destAddress.toString();
 
     ChannelPipeline pipeline = this.channel.pipeline();
-    pipeline.addLast("startTlsServerHandler", new StartTlsServerHandler(this));
     pipeline.addLast("decoder", new DiameterMessageDecoder(parenConnection, parser));
-    pipeline.addLast("msgHandler", new DiameterMessageHandler(parentConnection, true));
+    pipeline.addLast("msgHandler", new DiameterMessageHandler(parentConnection));
     pipeline.addLast("encoder", new DiameterMessageEncoder(parser));
     pipeline.addLast("inbandWriter", new InbandSecurityHandler());
 
@@ -109,6 +128,11 @@ public class TLSTransportClient {
   // only client side
   public void start() throws InterruptedException {
     logger.debug("Staring client TLSTransportClient {} ", socketDescription);
+
+    if (isServer) {
+      logger.debug("Server connection! cannot start", socketDescription);
+      return;
+    }
     if (isConnected()) {
       logger.debug("Already connected TLSTransportClient {} ", socketDescription);
       return;
@@ -119,19 +143,16 @@ public class TLSTransportClient {
     bootstrap.group(workerGroup).channel(NioSocketChannel.class).handler(new ChannelInitializer<SocketChannel>() {
       @Override
       protected void initChannel(SocketChannel channel) throws Exception {
-        ChannelPipeline pipeline = channel.pipeline();
+        ChannelPipeline pipeline = channel.pipeline();        
         pipeline.addLast("decoder", new DiameterMessageDecoder(parentConnection, parser));
-        pipeline.addLast("msgHandler", new DiameterMessageHandler(parentConnection, false));
-        pipeline.addLast("startTlsInitiator", new StartTlsInitiator(config, TLSTransportClient.this));
+        pipeline.addLast("msgHandler", new DiameterMessageHandler(parentConnection));
         pipeline.addLast("encoder", new DiameterMessageEncoder(parser));
         pipeline.addLast("inbandWriter", new InbandSecurityHandler());
       }
     });
 
     this.channel = bootstrap.remoteAddress(destAddress).connect().sync().channel();
-
     parentConnection.onConnected();
-
     logger.debug("Started TLS Transport on Socket {}", socketDescription);
   }
 
@@ -161,7 +182,7 @@ public class TLSTransportClient {
     return this.origAddress;
   }
 
-  void sendMessage(IMessage message) throws IOException {
+  void sendMessage(IMessage message) throws Exception {
     if (!isConnected()) {
       throw new IOException("Failed to send message over [" + socketDescription + "]");
     }
@@ -171,7 +192,39 @@ public class TLSTransportClient {
     }
 
     logger.debug("About to send a message over the TLS socket [{}]", socketDescription);
-    channel.writeAndFlush(message);
+    channel.write(message);
+    if (message.getCommandCode() == IMessage.CAPABILITIES_EXCHANGE_ANSWER && hasClientInbandSecurity) {
+      installSslHandler(channel);      
+    }
+    channel.flush();
+
+  }
+
+  @SuppressWarnings("unchecked")
+  public void installSslHandler(Channel channel) throws Exception {
+    if (channel.pipeline().get(SslHandler.class) != null) {
+      logger.debug("SslHandler already exists in the pipeline");
+      return;
+    }
+
+    logger.debug("Inserting SslHandler in the pipeline");
+    final TLSTransportClient client = this.parentConnection.getClient();
+    SslContext sslContext = SslContextFactory.getSslContext(client.getConfig(), client.isServer());
+    SSLEngine sslEngine = sslContext.newEngine(channel.alloc());
+    sslEngine.setUseClientMode(!client.isServer());
+    SslHandler sslHandler = new SslHandler(sslEngine, false);
+    sslHandler.handshakeFuture().addListener(new GenericFutureListener() {
+      @Override
+      public void operationComplete(Future f) throws Exception {
+        if (!f.isSuccess()) {
+          logger.error(f.cause().getMessage(), f.cause());
+        } else {
+          tlsHandshakingState = TlsHandshakingState.SHAKEN;
+        }
+      }
+    });
+    tlsHandshakingState = TlsHandshakingState.SHAKING;
+    channel.pipeline().addBefore("decoder", "sslHandler", sslHandler);
   }
 
   boolean isConnected() {
@@ -179,12 +232,12 @@ public class TLSTransportClient {
   }
 
   public void stop() {
-    //logger.debug("Stopping TLS Transport {}", socketDescription);
+    // logger.debug("Stopping TLS Transport {}", socketDescription);
 
     closeChannel();
     closeWorkerGroup();
 
-    //logger.debug("TLS Transport is stopped {}", socketDescription);
+    // logger.debug("TLS Transport is stopped {}", socketDescription);
 
     getParent().disconnect();
   }
@@ -235,6 +288,14 @@ public class TLSTransportClient {
 
   public Configuration getConfig() {
     return config;
+  }
+
+  public boolean isServer() {
+    return isServer;
+  }
+
+  public void setHasClientInbandSecurity(boolean hasClientInbandSecurity) {
+    this.hasClientInbandSecurity = hasClientInbandSecurity;
   }
 
 }

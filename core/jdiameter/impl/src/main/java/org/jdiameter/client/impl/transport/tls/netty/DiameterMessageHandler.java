@@ -19,32 +19,27 @@
 
 package org.jdiameter.client.impl.transport.tls.netty;
 
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.util.ReferenceCountUtil;
+
+import org.jdiameter.api.Avp;
 import org.jdiameter.api.AvpDataException;
 import org.jdiameter.client.api.IMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.util.ReferenceCountUtil;
 
 /**
  * 
  * @author <a href="mailto:jqayyum@gmail.com"> Jehanzeb Qayyum </a>
  */
 public class DiameterMessageHandler extends ChannelInboundHandlerAdapter {
-  protected static final Logger logger = LoggerFactory.getLogger(DiameterMessageHandler.class);
+  private static final Logger logger = LoggerFactory.getLogger(DiameterMessageHandler.class);
 
-  protected final TLSClientConnection parentConnection;
-  protected boolean autoRelease;
+  private final TLSClientConnection parentConnection;
 
-  public DiameterMessageHandler(TLSClientConnection parentConnection, boolean autoRelease) {
+  public DiameterMessageHandler(TLSClientConnection parentConnection) {
     this.parentConnection = parentConnection;
-    this.autoRelease = autoRelease;
-  }
-
-  public void setAutoRelease(boolean autoRelease) {
-    this.autoRelease = autoRelease;
   }
 
   @Override
@@ -56,15 +51,22 @@ public class DiameterMessageHandler extends ChannelInboundHandlerAdapter {
         logger.debug("Passing message on to parent {}", this.parentConnection.getKey());
         parentConnection.onMessageReceived(m);
         logger.debug("Finished passing message on to parent {}", this.parentConnection.getKey());
+
+        // sslHandler setup
+        Avp inbandAvp = m.getAvps().getAvp(Avp.INBAND_SECURITY_ID);
+        boolean hasInbandSecurity = inbandAvp != null && inbandAvp.getUnsigned32() == 1;
+        logger.debug("hasInbandSecurity {}", hasInbandSecurity);
+        if (m.getCommandCode() == IMessage.CAPABILITIES_EXCHANGE_REQUEST) {
+          parentConnection.getClient().setHasClientInbandSecurity(hasInbandSecurity);
+        } else if (m.getCommandCode() == IMessage.CAPABILITIES_EXCHANGE_ANSWER && hasInbandSecurity) {
+          parentConnection.getClient().installSslHandler(ctx.channel());
+        }
+
       } catch (AvpDataException e) {
         logger.debug("Garbage was received. Discarding. {}", this.parentConnection.getKey());
         parentConnection.onAvpDataException(e);
       } finally {
-        if (autoRelease) {
-          ReferenceCountUtil.release(msg);
-        } else {
-          ctx.fireChannelRead(m);
-        }
+        ReferenceCountUtil.release(msg);
       }
     }
   }

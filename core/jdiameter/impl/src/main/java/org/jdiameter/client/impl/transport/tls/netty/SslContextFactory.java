@@ -29,20 +29,18 @@ import static org.jdiameter.client.impl.helpers.Parameters.TDManager;
 import static org.jdiameter.client.impl.helpers.Parameters.TDPwd;
 import static org.jdiameter.client.impl.helpers.Parameters.TDStore;
 import static org.jdiameter.client.impl.helpers.Parameters.TrustData;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
 
 import java.io.FileInputStream;
 import java.security.KeyStore;
 
 import javax.net.ssl.KeyManagerFactory;
-import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManagerFactory;
 
 import org.jdiameter.api.Configuration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import io.netty.handler.ssl.SslContext;
-import io.netty.handler.ssl.SslContextBuilder;
 
 /**
  * 
@@ -51,13 +49,17 @@ import io.netty.handler.ssl.SslContextBuilder;
 public abstract class SslContextFactory {
   private static final Logger logger = LoggerFactory.getLogger(SslContextFactory.class);
 
-  public static SslContext getSslContextForClient(Configuration config) throws SSLException, Exception {
+  public static SslContext getSslContext(Configuration config, boolean isServer) throws Exception {
+    return isServer ? getSslContextForServer(config) : getSslContextForClient(config);
+  }
+
+  private static SslContext getSslContextForClient(Configuration config) throws Exception {
     SslContext sslContext = SslContextBuilder.forClient().keyManager(getKeyManagerFactory(config))
         .trustManager(getTrustManagerFactory(config)).build();
     return sslContext;
   }
 
-  public static SslContext getSslContextForServer(Configuration config) throws SSLException, Exception {
+  private static SslContext getSslContextForServer(Configuration config) throws Exception {
     SslContext sslContext = SslContextBuilder.forServer(getKeyManagerFactory(config))
         .trustManager(getTrustManagerFactory(config)).build();
     return sslContext;
